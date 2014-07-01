@@ -129,6 +129,22 @@ run(delete, KeyGen, _ValueGen,
             {ok, NewState};
         {error, Reason} ->
             {error, Reason, NewState}
+    end;
+run(put_delete, KeyGen, ValueGen,
+    #state{host_base=HostBase, user_count=UserCount} = State) ->
+    Key = KeyGen(),
+    {NextUrl, NewState} = next_url(State),
+    User = user(UserCount, Key),
+    case do_put(NextUrl, Key, ValueGen, HostBase, User) of
+        ok ->
+            case do_delete(NextUrl, Key, HostBase, User) of
+                ok ->
+                    {ok, NewState};
+                {error, Reason} ->
+                    {error, Reason, NewState}
+            end;
+        {error, Reason} ->
+            {error, Reason, NewState}
     end.
 
 %% ====================================================================
