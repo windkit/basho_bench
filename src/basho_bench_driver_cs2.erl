@@ -50,7 +50,7 @@
 
 new(Id) ->
     %% The IPs, port and path we'll be testing
-    Ips  = basho_bench_config:get(cs2_http_ips, ["127.0.0.1"]),
+    Ips  = basho_bench_config:get(cs2_http_hosts, ["127.0.0.1"]),
     DefaultPort = basho_bench_config:get(cs2_raw_port, 8098),
 
     Disconnect = basho_bench_config:get(cs2_raw_disconnect_frequency, infinity),
@@ -145,7 +145,20 @@ run(put_delete, KeyGen, ValueGen,
             end;
         {error, Reason} ->
             {error, Reason, NewState}
+    end;
+run(get_noop, KeyGen, _ValueGen, #state{host_base=HostBase} = State) ->
+    Key = KeyGen(),
+    {NextUrl, NewState} = next_url(State),
+    User = #user{key_id = <<"key">>, key_secret = <<"secret">>, bucket = <<"bucket">>},
+    case do_get(NextUrl, Key, HostBase, User) of
+        {not_found, _Url} ->
+            {ok, NewState};
+        {ok, _Url, _Headers, _Body} ->
+            {ok, NewState};
+        {error, Reason} ->
+            {error, Reason, NewState}
     end.
+
 
 %% ====================================================================
 %% Internal functions
@@ -173,13 +186,18 @@ global_setup(Url, HostBase, UserCount) ->
             end
     end,
     application:start(ibrowse),
-    Self = self(),
-    spawn(fun() ->
-                  erlang:process_flag(trap_exit, true),
-                  setup_users(Url, HostBase, UserCount, Self)
-          end),
-    receive
-        setup_finish -> ok
+    case basho_bench_config:get(operations, []) of
+        [{get_noop, 1}] ->
+            ok;
+        _ ->
+            Self = self(),
+            spawn(fun() ->
+                          erlang:process_flag(trap_exit, true),
+                          setup_users(Url, HostBase, UserCount, Self)
+                  end),
+            receive
+                setup_finish -> ok
+            end
     end.
 
 setup_users(Url, HostBase, UserCount, From) ->
@@ -194,7 +212,6 @@ setup_users(Url, HostBase, UserCount, From) ->
                    {keypos, #user.index},
                    {read_concurrency, true}]),
     [ets:insert(?TAB, User) || User <- Users],
-    %% [lager:debug("********** User: ~p~n", [User]) || User <- ets:tab2list(?TAB)],
     From ! setup_finish,
     receive
         wati_forever -> ok
@@ -221,10 +238,8 @@ maybe_create_user(BaseUrl, UserPrefix, UserIndex) ->
             %% 409 Conflict (User Already Exists)
             ok;
         {ok, Code, Header, Body} ->
-            lager:error("Create user: ~p~n", [{Code, Header, Body}]),
             throw({error, {user_creation, Code, Header, Body}});
         {error, Reason} ->
-            lager:error("Create user: ~p~n", [Reason]),
             throw({error, {user_creation, Reason}})
     end.
 
