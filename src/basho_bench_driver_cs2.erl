@@ -378,30 +378,32 @@ do_delete(BaseUrl, Key, HostBase, User) ->
     end.
 
 connect(Url) ->
-    case erlang:get({ibrowse_pid, Url#url.host}) of
+    Key = {ibrowse_pid, Url#url.host, Url#url.port},
+    case erlang:get(Key) of
         undefined ->
             {ok, Pid} = ibrowse_http_client:start({Url#url.host, Url#url.port}),
-            erlang:put({ibrowse_pid, Url#url.host}, Pid),
+            erlang:put(Key, Pid),
             Pid;
         Pid ->
             case is_process_alive(Pid) of
                 true ->
                     Pid;
                 false ->
-                    erlang:erase({ibrowse_pid, Url#url.host}),
+                    erlang:erase(Key),
                     connect(Url)
             end
     end.
 
 
 disconnect(Url) ->
-    case erlang:get({ibrowse_pid, Url#url.host}) of
+    Key = {ibrowse_pid, Url#url.host, Url#url.port},
+    case erlang:get(Key) of
         undefined ->
             ok;
         OldPid ->
             catch(ibrowse_http_client:stop(OldPid))
     end,
-    erlang:erase({ibrowse_pid, Url#url.host}),
+    erlang:erase(Key),
     ok.
 
 maybe_disconnect(Url) ->
