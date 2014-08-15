@@ -302,8 +302,8 @@ maybe_create_bucket(BaseUrl, HostBase, User) ->
     case send_request(Url, HostBase, put, [], User) of
         {ok, "200", _Headers, _Body} ->
             ok;
-        {ok, "409", _Headers, _Body} ->
-            ok;
+        %% {ok, "409", _Headers, _Body} ->
+        %%     ok;
         {ok, Code, Header, Body} ->
             lager:error("Create bucket: ~p~n", [{Code, Header, Body}]),
             throw({error, {bucket_creation, Code, Header, Body}});
