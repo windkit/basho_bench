@@ -68,6 +68,10 @@ init([]) ->
             undefined -> [];
             _Driver -> [?CHILD(basho_bench_measurement, worker)]
         end,
+    Tid = ets:new(?ETS_SOURCE_VALUE, [public, named_table, {read_concurrency, true}]),
+    SourceSz = basho_bench_config:get(?VAL_GEN_SRC_SIZE, 1048576),
+    Source = crypto:rand_bytes(SourceSz),
+    ets:insert(Tid, {key, Source}),
 
     {ok, {{one_for_one, 5, 10},
         [?CHILD(basho_bench_stats, worker)] ++

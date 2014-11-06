@@ -13,3 +13,5 @@
 
 -define(VAL_GEN_BLOB_CFG, value_generator_blob_file).
 -define(VAL_GEN_SRC_SIZE, value_generator_source_size).
+
+-define(ETS_SOURCE_VALUE, ets_source_value).

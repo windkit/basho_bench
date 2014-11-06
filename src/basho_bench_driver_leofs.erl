@@ -34,7 +34,6 @@
                  path_params,        % Params to append on the path
                  id,                 % Job ID passed through new/1 minus 1 -> 0... concurrent
                  concurrent,         % Number of Job Processed
-                 value_source,       % source for a value generator
                  value_size_groups,  % size groups for a value generator
                  check_integrity}).  % Params to test data integrity
 
@@ -49,8 +48,10 @@
 new(Id) ->
     %% Guaranteed One shot
     case Id of
-        1 -> ets:new(?ETS_BODY_MD5, [public, named_table, {read_concurrency, true}]);
-        _ -> void
+        1 -> 
+            ets:new(?ETS_BODY_MD5, [public, named_table, {read_concurrency, true}]);
+        _ ->
+            wait_for_initialized_ets(300)
     end,
     %% Make sure ibrowse is available
     case code:which(ibrowse) of
@@ -99,7 +100,6 @@ new(Id) ->
     {ok, #state { base_urls = BaseUrls,
                   base_urls_index = BaseUrlsIndex,
                   path_params = Params,
-                  value_source = init_source(),
                   value_size_groups = size_group_load_config(VSG, []),
                   id = Id - 1,
                   concurrent = Concurrent,
@@ -138,9 +138,8 @@ run(get, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = C
             {error, Reason, S2}
     end;
 
-run(test, _KeyGen, _ValueGen, #state{value_source = VS,
-                                     value_size_groups = VSG} = State) ->
-    {Group, _Val} = value_gen_with_size_groups(VS, VSG),
+run(test, _KeyGen, _ValueGen, #state{value_size_groups = VSG} = State) ->
+    {Group, _Val} = value_gen_with_size_groups(VSG),
     C = case erlang:get({size_groups_counter, Group}) of
         undefined -> 0;
         Else -> Else
@@ -153,12 +152,11 @@ run(test, _KeyGen, _ValueGen, #state{value_source = VS,
     {ok, State};
 
 run(put, KeyGen, _ValueGen, #state{check_integrity = CI,
-                                   value_source = VS,
                                    value_size_groups = VSG, 
                                    id = Id,
                                    concurrent = Concurrent} = State) ->
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
-    {_, Val} = value_gen_with_size_groups(VS, VSG),
+    {_, Val} = value_gen_with_size_groups(VSG),
     {NextUrl, S2} = next_url(State),
     Url = url(NextUrl, Key, State#state.path_params),
     case do_put(Url, [], Val) of
@@ -199,23 +197,19 @@ size_group_load_config([{Weight, Min, Max}|Rest], Acc) ->
     List = lists:duplicate(Weight, {Min, Max}),
     size_group_load_config(Rest, [List|Acc]).
 
-init_source() ->
-    SourceSz = basho_bench_config:get(?VAL_GEN_SRC_SIZE, 1048576),
-    {?VAL_GEN_SRC_SIZE, SourceSz, crypto:rand_bytes(SourceSz)}.
-
-data_block({SourceCfg, SourceSz, Source}, BlockSize) ->
+data_block(SourceSz, Source, BlockSize) ->
     case SourceSz - BlockSize > 0 of
         true ->
             Offset = random:uniform(SourceSz - BlockSize),
             <<_:Offset/bytes, Slice:BlockSize/bytes, _Rest/binary>> = Source,
             Slice;
         false ->
-            ?WARN("~p is too small ~p < ~p\n",
-                  [SourceCfg, SourceSz, BlockSize]),
+            ?WARN("Data Source is too small ~p < ~p\n",
+                  [SourceSz, BlockSize]),
             Source
     end.
 
-value_gen_with_size_groups(ValueSource, SizeGroups) ->
+value_gen_with_size_groups(SizeGroups) ->
     Len = length(SizeGroups),
     Nth = random:uniform(Len),
     {Min, Max} = lists:nth(Nth, SizeGroups),
@@ -223,8 +217,24 @@ value_gen_with_size_groups(ValueSource, SizeGroups) ->
         true -> random:uniform(Max - Min) + Min - 1;
         false -> Max
     end,
-    {Nth, data_block(ValueSource, Size)}.
+    Value = case catch ets:lookup(?ETS_SOURCE_VALUE, key) of
+        [{_Key, Source}] ->
+            Source;
+        _Other ->
+            List = lists:seq(1, Size),
+            list_to_binary(List)
+    end,
+    {Nth, data_block(size(Value), Value, Size)}.
    
+wait_for_initialized_ets(Sleep) ->
+    timer:sleep(Sleep),
+    case catch ets:lookup(?ETS_SOURCE_VALUE, key) of
+        [_Source|_] ->
+            ok;
+        _Other ->
+            wait_for_initialized_ets(Sleep)
+    end.
+
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
