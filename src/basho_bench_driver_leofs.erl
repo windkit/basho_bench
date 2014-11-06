@@ -38,8 +38,8 @@
                  value_size_groups,  % size groups for a value generator
                  check_integrity}).  % Params to test data integrity
 
--define(S3_ACC_KEY,      "test:tester").
--define(S3_SEC_KEY,      "testing").
+-define(S3_ACC_KEY,      "05236").
+-define(S3_SEC_KEY,      "802562235").
 -define(S3_CONTENT_TYPE, "application/octet-stream").
 -define(ETS_BODY_MD5, ets_body_md5).
 
