@@ -26,7 +26,6 @@
 
 -include("basho_bench.hrl").
 
--define(ETS_TBL_SOURCE_VALUE, 'bb_src_val').
 
 %% ====================================================================
 %% API
@@ -86,19 +85,19 @@ init_source(Id) ->
 init_source(Id, undefined) ->
     SourceSz = basho_bench_config:get(?VAL_GEN_SRC_SIZE, 1048576),
     if Id == 1 -> 
-            ?DEBUG("random source\n", []),
-            Tid = ets:new(?ETS_TBL_SOURCE_VALUE, [{read_concurrency, true}]),
-            Source = crypto:rand_bytes(SourceSz),
-            ets:insert(Tid, {key, Source});
+            ?DEBUG("random source\n", []);
+            %Tid = ets:new(?ETS_TBL_SOURCE_VALUE, [{read_concurrency, true}]),
+            %Source = crypto:rand_bytes(SourceSz),
+            %ets:insert(Tid, {key, Source});
        true    -> ok
     end,
     {?VAL_GEN_SRC_SIZE, SourceSz};
 init_source(Id, Path) ->
     {Path, {ok, Bin}} = {Path, file:read_file(Path)},
     if Id == 1 -> 
-            ?DEBUG("path source ~p ~p\n", [size(Bin), Path]),
-            Tid = ets:new(?ETS_TBL_SOURCE_VALUE, [{read_concurrency, true}]),
-            ets:insert(Tid, {key, Bin});
+            ?DEBUG("path source ~p ~p\n", [size(Bin), Path]);
+            %Tid = ets:new(?ETS_TBL_SOURCE_VALUE, [{read_concurrency, true}]),
+            %ets:insert(Tid, {key, Bin});
        true    -> ok
     end,
     {?VAL_GEN_BLOB_CFG, size(Bin)}.
@@ -107,12 +106,14 @@ data_block({SourceCfg, SourceSz}, BlockSize) ->
     case SourceSz - BlockSize > 0 of
         true ->
             Offset = random:uniform(SourceSz - BlockSize),
-            [Source|_]= ets:lookup(?ETS_TBL_SOURCE_VALUE, key),
+            [{key, Source}|_]= ets:lookup(?ETS_SOURCE_VALUE, key),
             <<_:Offset/bytes, Slice:BlockSize/bytes, _Rest/binary>> = Source,
             Slice;
         false ->
             ?WARN("~p is too small ~p < ~p\n",
                   [SourceCfg, SourceSz, BlockSize]),
-            [Source|_]= ets:lookup(?ETS_TBL_SOURCE_VALUE, key),
+            [{key, Source}|_]= ets:lookup(?ETS_SOURCE_VALUE, key),
             Source
     end.
+
+
