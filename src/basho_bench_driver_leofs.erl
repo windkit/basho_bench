@@ -25,7 +25,7 @@
          run/4]).
 
 -include("basho_bench.hrl").
--include("leo_s3_auth.hrl").
+-include_lib("leo_s3_libs/include/leo_s3_auth.hrl").
 
 -record(url, {abspath, host, port, username, password, path, protocol, host_type}).
 
@@ -34,11 +34,14 @@
                  path_params,        % Params to append on the path
                  id,                 % Job ID passed through new/1 minus 1 -> 0... concurrent
                  concurrent,         % Number of Job Processed
+                 value_source,       % source for a value generator
                  value_size_groups,  % size groups for a value generator
+                 aws_chunk_size,     % aws-chunked Chunk Size
+                 aws_chunk_nohash,   % aws-chunked skip content SHA-256
                  check_integrity}).  % Params to test data integrity
 
 -define(S3_ACC_KEY,      "05236").
--define(S3_SEC_KEY,      "802562235").
+-define(S3_SEC_KEY,      <<"802562235">>).
 -define(S3_CONTENT_TYPE, "application/octet-stream").
 -define(ETS_BODY_MD5, ets_body_md5).
 
@@ -48,10 +51,8 @@
 new(Id) ->
     %% Guaranteed One shot
     case Id of
-        1 -> 
-            ets:new(?ETS_BODY_MD5, [public, named_table, {read_concurrency, true}]);
-        _ ->
-            wait_for_initialized_ets(300)
+        1 -> ets:new(?ETS_BODY_MD5, [public, named_table, {read_concurrency, true}]);
+        _ -> void
     end,
     %% Make sure ibrowse is available
     case code:which(ibrowse) of
@@ -97,12 +98,17 @@ new(Id) ->
     VSG = basho_bench_config:get(
            value_size_groups, [{1, 4096, 8192},{1, 16384, 32768}]),
     Concurrent = basho_bench_config:get(concurrent, 0),
+    AWSChunkSize = basho_bench_config:get(aws_chunk_size, 131072),
+    AWSChunkNoHash = basho_bench_config:get(aws_chunk_nohash, true),
     {ok, #state { base_urls = BaseUrls,
                   base_urls_index = BaseUrlsIndex,
                   path_params = Params,
+                  value_source = init_source(),
                   value_size_groups = size_group_load_config(VSG, []),
                   id = Id - 1,
                   concurrent = Concurrent,
+                  aws_chunk_size = AWSChunkSize,
+                  aws_chunk_nohash = AWSChunkNoHash,
                   check_integrity = CI }}.
 
 keygen_global_uniq(false, _Id, _Concurrent, KeyGen) ->
@@ -138,8 +144,34 @@ run(get, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = C
             {error, Reason, S2}
     end;
 
-run(test, _KeyGen, _ValueGen, #state{value_size_groups = VSG} = State) ->
-    {Group, _Val} = value_gen_with_size_groups(VSG),
+run(getv4, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
+    {NextUrl, S2} = next_url(State),
+    case do_get_v4(url(NextUrl, Key, State#state.path_params)) of
+        {not_found, _Url} ->
+            {ok, S2};
+        {ok, _Url, _Headers, Body} ->
+            case CI of
+                true ->
+                    case ets:lookup(?ETS_BODY_MD5, Key) of
+                        [{_Key, LocalMD5}|_] ->
+                            RemoteMD5 = erlang:md5(Body),
+                            case RemoteMD5 =:= LocalMD5 of
+                                true -> {ok, S2};
+                                false -> {error, checksum_error, S2}
+                            end;
+                        _ -> {ok, S2}
+                    end;
+                false -> {ok, S2}
+            end;
+        {error, Reason} ->
+            io:format("~p~n",[Reason]),
+            {error, Reason, S2}
+    end;
+
+run(test, _KeyGen, _ValueGen, #state{value_source = VS,
+                                     value_size_groups = VSG} = State) ->
+    {Group, _Val} = value_gen_with_size_groups(VS, VSG),
     C = case erlang:get({size_groups_counter, Group}) of
         undefined -> 0;
         Else -> Else
@@ -152,11 +184,12 @@ run(test, _KeyGen, _ValueGen, #state{value_size_groups = VSG} = State) ->
     {ok, State};
 
 run(put, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                   value_source = VS,
                                    value_size_groups = VSG, 
                                    id = Id,
                                    concurrent = Concurrent} = State) ->
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
-    {_, Val} = value_gen_with_size_groups(VSG),
+    {_, Val} = value_gen_with_size_groups(VS, VSG),
     {NextUrl, S2} = next_url(State),
     Url = url(NextUrl, Key, State#state.path_params),
     case do_put(Url, [], Val) of
@@ -172,6 +205,51 @@ run(put, KeyGen, _ValueGen, #state{check_integrity = CI,
             {error, Reason, S2}
     end;
 
+run(putv4, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                     value_source = VS,
+                                     value_size_groups = VSG,
+                                     id = Id,
+                                     concurrent = Concurrent} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
+    {_, Val} = value_gen_with_size_groups(VS, VSG),
+    {NextUrl, S2} = next_url(State),
+    Url = url(NextUrl, Key, State#state.path_params),
+    case do_put_v4(Url, [], Val, <<"dummy">>) of
+        ok ->
+            case CI of
+                true ->
+                    LocalMD5 = erlang:md5(Val),
+                    ets:insert(?ETS_BODY_MD5, {Key, LocalMD5});
+                false -> void
+            end,
+            {ok, S2};
+        {error, Reason} ->
+            {error, Reason, S2}
+    end;
+
+run(putv4chunk, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                          value_source = VS,
+                                          value_size_groups = VSG,
+                                          id = Id,
+                                          aws_chunk_size = AWSChunkSize,
+                                          aws_chunk_nohash = AWSChunkNoHash,
+                                          concurrent = Concurrent} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
+    {_, Val} = value_gen_with_size_groups(VS, VSG),
+    {NextUrl, S2} = next_url(State),
+    Url = url(NextUrl, Key, State#state.path_params),
+    case do_put_v4_chunk(Url, [], Val, AWSChunkSize, AWSChunkNoHash) of
+        ok ->
+            case CI of
+                true ->
+                    LocalMD5 = erlang:md5(Val),
+                    ets:insert(?ETS_BODY_MD5, {Key, LocalMD5});
+                false -> void
+            end,
+            {ok, S2};
+        {error, Reason} ->
+            {error, Reason, S2}
+    end;
 
 run(delete, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
@@ -197,19 +275,23 @@ size_group_load_config([{Weight, Min, Max}|Rest], Acc) ->
     List = lists:duplicate(Weight, {Min, Max}),
     size_group_load_config(Rest, [List|Acc]).
 
-data_block(SourceSz, Source, BlockSize) ->
+init_source() ->
+    SourceSz = basho_bench_config:get(?VAL_GEN_SRC_SIZE, 1048576),
+    {?VAL_GEN_SRC_SIZE, SourceSz, crypto:rand_bytes(SourceSz)}.
+
+data_block({SourceCfg, SourceSz, Source}, BlockSize) ->
     case SourceSz - BlockSize > 0 of
         true ->
             Offset = random:uniform(SourceSz - BlockSize),
             <<_:Offset/bytes, Slice:BlockSize/bytes, _Rest/binary>> = Source,
             Slice;
         false ->
-            ?WARN("Data Source is too small ~p < ~p\n",
-                  [SourceSz, BlockSize]),
+            ?WARN("~p is too small ~p < ~p\n",
+                  [SourceCfg, SourceSz, BlockSize]),
             Source
     end.
 
-value_gen_with_size_groups(SizeGroups) ->
+value_gen_with_size_groups(ValueSource, SizeGroups) ->
     Len = length(SizeGroups),
     Nth = random:uniform(Len),
     {Min, Max} = lists:nth(Nth, SizeGroups),
@@ -217,24 +299,8 @@ value_gen_with_size_groups(SizeGroups) ->
         true -> random:uniform(Max - Min) + Min - 1;
         false -> Max
     end,
-    Value = case catch ets:lookup(?ETS_SOURCE_VALUE, key) of
-        [{_Key, Source}] ->
-            Source;
-        _Other ->
-            List = lists:seq(1, Size),
-            list_to_binary(List)
-    end,
-    {Nth, data_block(size(Value), Value, Size)}.
+    {Nth, data_block(ValueSource, Size)}.
    
-wait_for_initialized_ets(Sleep) ->
-    timer:sleep(Sleep),
-    case catch ets:lookup(?ETS_SOURCE_VALUE, key) of
-        [_Source|_] ->
-            ok;
-        _Other ->
-            wait_for_initialized_ets(Sleep)
-    end.
-
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
@@ -255,6 +321,25 @@ next_url(State) ->
 url(BaseUrl, Key, Params) ->
     BaseUrl#url { path = lists:concat([BaseUrl#url.path, '/', Key, Params]) }.
 
+do_get_v4(Url) ->
+    ValSHA256 = leo_hex:binary_to_hexbin(crypto:hash(sha256, <<>>)),
+    {_, _, _, Auth} = gen_sig_v4("GET", Url, ValSHA256),
+    Headers_2 = [
+                 {"x-amz-content-sha256", ValSHA256},
+                 {"x-amz-date", "20130524T000000Z"},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", Auth}
+                ],
+    case send_request(Url, Headers_2, get, [], [{response_format, binary}]) of
+        {ok, "404", _Headers, _Body} ->
+            {not_found, Url};
+        {ok, "200", Headers, Body} ->
+            {ok, Url, Headers, Body};
+        {ok, Code, _Headers, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 do_get(Url) ->
     case send_request(Url, [], get, [], [{response_format, binary}]) of
@@ -270,20 +355,37 @@ do_get(Url) ->
 
 gen_sig(HTTPMethod, Url) ->
     [Bucket|_] = string:tokens(Url#url.path, "/"),
-    SignParams = #sign_params{http_verb    = HTTPMethod,
-                              content_md5  = [],
-                              content_type = ?S3_CONTENT_TYPE,
-                              date         = [],
-                              bucket       = Bucket,
-                              uri          = Url#url.path,
-                              query_str    = [],
-                              amz_headers  = []
+    SignParams = #sign_params{http_verb    = list_to_binary(HTTPMethod),
+                              content_type = list_to_binary(?S3_CONTENT_TYPE),
+                              bucket       = list_to_binary(Bucket),
+                              raw_uri      = list_to_binary(Url#url.path),
+                              requested_uri = list_to_binary(Url#url.path),
+                              sign_ver     = ?AWS_SIGN_VER_2
                              },
-    Sig = leo_s3_auth:get_signature(?S3_SEC_KEY, SignParams),
+    {Sig, _, _} = leo_s3_auth:get_signature(?S3_SEC_KEY, SignParams, #sign_v4_params{}),
     io_lib:format("AWS ~s:~s", [?S3_ACC_KEY, Sig]).
 
+gen_sig_v4(HTTPMethod, Url, ValSHA256) ->
+    Headers = [{<<"x-amz-content-sha256">>, ValSHA256},
+               {<<"x-amz-date">>, <<"20130524T000000Z">>}],
+    SignParams = #sign_params{http_verb    = list_to_binary(HTTPMethod),
+                              raw_uri      = list_to_binary(Url#url.path),
+                              sign_ver     = ?AWS_SIGN_VER_4,
+                              headers      = Headers},
+    Credential = <<?S3_ACC_KEY, "/20130524/us-east-1/s3/aws4_request">>,
+    SignedHeader = <<"x-amz-content-sha256">>,
+    SignV4Params = #sign_v4_params{credential = Credential,
+                                   signed_headers = SignedHeader},
+    {Sig, SignHead, SignKey} = leo_s3_auth:get_signature(?S3_SEC_KEY, SignParams, SignV4Params),
+    Auth = io_lib:format("AWS4-HMAC-SHA256 Credential=~s, SignedHeaders=~s, Signature=~s", [Credential, SignedHeader, Sig]),
+    {Sig, SignHead, SignKey, Auth}.
+
 do_put(Url, Headers, Value) ->
-    case send_request(Url, Headers ++ [{'Content-Type', ?S3_CONTENT_TYPE}, {'Authorization', gen_sig("PUT", Url)}],
+    Headers_2 = [
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", gen_sig("PUT", Url)}
+                ],
+    case send_request(Url, Headers ++ Headers_2,
                       put, Value, [{response_format, binary}]) of
         {ok, "200", _Header, _Body} ->
             ok;
@@ -294,6 +396,87 @@ do_put(Url, Headers, Value) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+do_put_v4(Url, Headers, Value, ValSHA256) ->
+    {_, _, _, Auth} = gen_sig_v4("PUT", Url, ValSHA256),
+    Headers_2 = [
+                 {"x-amz-content-sha256", ValSHA256},
+                 {"x-amz-date", "20130524T000000Z"},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", Auth}
+                ],
+    case send_request(Url, Headers ++ Headers_2,
+                      put, Value, [{response_format, binary}]) of
+        {ok, "200", _Header, _Body} ->
+            ok;
+        {ok, "204", _Header, _Body} ->
+            ok;
+        {ok, Code, _Header, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash) ->
+    {Sign, _SignHead, SignKey, Auth} = gen_sig_v4("PUT", Url, <<"STREAMING-AWS4-HMAC-SHA256-PAYLOAD">>),
+    Headers_2 = [
+                 {"x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+                 {"x-amz-date", "20130524T000000Z"},
+                 {"x-amz-decoded-content-length", byte_size(Value)},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", Auth}
+                ],
+    Chunks = gen_chunks(Value, Sign, ChunkSize, SignKey, NoHash),
+    case send_request(Url, Headers ++ Headers_2,
+                      put, Chunks, [{response_format, binary}]) of
+        {ok, "200", _Header, _Body} ->
+            ok;
+        {ok, "204", _Header, _Body} ->
+            ok;
+        {ok, Code, _Header, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Generate aws-chunked Chunks
+%% @private
+gen_chunks(Bin, Signature, ChunkSize, SignKey, NoHash) ->
+    gen_chunks(Bin, Signature, <<>>, byte_size(Bin), ChunkSize, SignKey, NoHash).
+
+gen_chunks(_Bin, PrevSign, Acc, 0, _ChunkSize, SignKey, NoHash) ->
+    {Chunk, _Sign} = compute_chunk(<<>>, PrevSign, SignKey, NoHash),
+    <<Acc/binary, Chunk/binary>>;
+gen_chunks(Bin, PrevSign, Acc, Remain, ChunkSize, SignKey, NoHash) when Remain < ChunkSize ->
+    <<ChunkPart:Remain/binary, _/binary>> = Bin,
+    {Chunk, Sign} = compute_chunk(ChunkPart, PrevSign, SignKey, NoHash),
+    gen_chunks(<<>>, Sign, <<Acc/binary, Chunk/binary>>, 0, ChunkSize, SignKey, NoHash);
+gen_chunks(Bin, PrevSign, Acc, Remain, ChunkSize, SignKey, NoHash) ->
+    <<ChunkPart:ChunkSize/binary, Rest/binary>> = Bin,
+    {Chunk, Sign} = compute_chunk(ChunkPart, PrevSign, SignKey, NoHash),
+    gen_chunks(Rest, Sign, <<Acc/binary, Chunk/binary>>, Remain - ChunkSize, ChunkSize, SignKey, NoHash).
+
+compute_chunk(Bin, PrevSign, SignKey, NoHash) ->
+    SignHead = <<"20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n">>,
+    Size = byte_size(Bin),
+    SizeHex = leo_hex:integer_to_hex(Size, 6),
+    ChunkHashBin = case NoHash of
+                       true ->
+                           <<"chunk-dummy">>;
+                       _ ->
+                           leo_hex:binary_to_hexbin(crypto:hash(sha256, Bin))
+                   end,
+    BinToSign = <<"AWS4-HMAC-SHA256-PAYLOAD\n",
+                  SignHead/binary,
+                  PrevSign/binary,  "\n",
+                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+                  ChunkHashBin/binary>>,
+    Signature = crypto:hmac(sha256, SignKey, BinToSign),
+    Sign = leo_hex:binary_to_hexbin(Signature),
+    SizeHexBin = list_to_binary(SizeHex),
+    Chunk = <<SizeHexBin/binary, ";", "chunk-signature=", Sign/binary, "\r\n",
+              Bin/binary, "\r\n">>,
+    {Chunk, Sign}.
 
 %% do_post(Url, Headers, ValueGen) ->
 %%     case send_request(Url, Headers ++ [{'Content-Type', 'application/octet-stream'}],
@@ -401,11 +584,9 @@ send_request(Url, Headers, Method, Body, Options) ->
 send_request(_Url, _Headers, _Method, _Body, _Options, 0) ->
     {error, max_retries};
 send_request(Url, Headers, Method, Body, Options, Count) ->
-    Date = httpd_util:rfc1123_date(),
-    Headers2 = [{'Date', Date}|Headers],
     Pid = connect(Url),
     case catch(ibrowse_http_client:send_req(
-                 Pid, Url, Headers2, Method, Body, Options,
+                 Pid, Url, Headers, Method, Body, Options,
                  basho_bench_config:get(http_raw_request_timeout, 5000))) of
 
         {ok, Status, RespHeaders, RespBody} ->
@@ -417,7 +598,7 @@ send_request(Url, Headers, Method, Body, Options, Count) ->
             disconnect(Url),
             case should_retry(Error) of
                 true ->
-                    send_request(Url, Headers2, Method, Body, Options, Count-1);
+                    send_request(Url, Headers, Method, Body, Options, Count-1);
 
                 false ->
                     normalize_error(Method, Error)
