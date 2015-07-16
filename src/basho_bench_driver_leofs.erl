@@ -400,7 +400,7 @@ do_put(Url, Headers, Value) ->
 do_put_v4(Url, Headers, Value, ValSHA256) ->
     {_, _, _, Auth} = gen_sig_v4("PUT", Url, ValSHA256),
     Headers_2 = [
-                 {"x-amz-content-sha256", ValSHA256},
+                 {"x-amz-content-sha256", binary_to_list(ValSHA256)},
                  {"x-amz-date", "20130524T000000Z"},
                  {"content-type", ?S3_CONTENT_TYPE},
                  {"authorization", Auth}
