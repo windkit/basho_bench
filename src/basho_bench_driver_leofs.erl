@@ -322,11 +322,13 @@ url(BaseUrl, Key, Params) ->
     BaseUrl#url { path = lists:concat([BaseUrl#url.path, '/', Key, Params]) }.
 
 do_get_v4(Url) ->
+    TS = leo_date:now(),
     ValSHA256 = leo_hex:binary_to_hexbin(crypto:hash(sha256, <<>>)),
-    {_, _, _, Auth} = gen_sig_v4("GET", Url, ValSHA256),
+    {_, _, _, Auth} = gen_sig_v4("GET", Url, ValSHA256, TS),
     Headers_2 = [
+                 {"Date", rfc1123_date_format(TS)},
                  {"x-amz-content-sha256", ValSHA256},
-                 {"x-amz-date", "20130524T000000Z"},
+                 {"x-amz-date", iso8601_date_format(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
                  {"authorization", Auth}
                 ],
@@ -353,10 +355,24 @@ do_get(Url) ->
             {error, Reason}
     end.
 
-gen_sig(HTTPMethod, Url) ->
+iso8601_date_format(GregorianSeconds) ->
+    {{Year, Month, Date},{Hour,Min,Sec}} =
+        calendar:universal_time_to_local_time(
+          calendar:gregorian_seconds_to_datetime(GregorianSeconds)),
+    lists:flatten(io_lib:format("~4..0w~2..0w~2..0wT~2..0w~2..0w~2..0wZ",
+                  [Year, Month, Date, Hour, Min, Sec])).
+
+rfc1123_date_format(GregorianSeconds) ->
+    DateTime =
+        calendar:universal_time_to_local_time(
+          calendar:gregorian_seconds_to_datetime(GregorianSeconds)),
+    httpd_util:rfc1123_date(DateTime).
+
+gen_sig(HTTPMethod, Url, TS) ->
     [Bucket|_] = string:tokens(Url#url.path, "/"),
     SignParams = #sign_params{http_verb    = list_to_binary(HTTPMethod),
                               content_type = list_to_binary(?S3_CONTENT_TYPE),
+                              date         = list_to_binary(rfc1123_date_format(TS)),
                               bucket       = list_to_binary(Bucket),
                               raw_uri      = list_to_binary(Url#url.path),
                               requested_uri = list_to_binary(Url#url.path),
@@ -365,9 +381,9 @@ gen_sig(HTTPMethod, Url) ->
     {Sig, _, _} = leo_s3_auth:get_signature(?S3_SEC_KEY, SignParams, #sign_v4_params{}),
     io_lib:format("AWS ~s:~s", [?S3_ACC_KEY, Sig]).
 
-gen_sig_v4(HTTPMethod, Url, ValSHA256) ->
+gen_sig_v4(HTTPMethod, Url, ValSHA256, TS) ->
     Headers = [{<<"x-amz-content-sha256">>, ValSHA256},
-               {<<"x-amz-date">>, <<"20130524T000000Z">>}],
+               {<<"x-amz-date">>, list_to_binary(iso8601_date_format(TS))}],
     SignParams = #sign_params{http_verb    = list_to_binary(HTTPMethod),
                               raw_uri      = list_to_binary(Url#url.path),
                               sign_ver     = ?AWS_SIGN_VER_4,
@@ -381,9 +397,11 @@ gen_sig_v4(HTTPMethod, Url, ValSHA256) ->
     {Sig, SignHead, SignKey, Auth}.
 
 do_put(Url, Headers, Value) ->
+    TS = leo_date:now(),
     Headers_2 = [
+                 {"Date", rfc1123_date_format(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
-                 {"authorization", gen_sig("PUT", Url)}
+                 {"authorization", gen_sig("PUT", Url, TS)}
                 ],
     case send_request(Url, Headers ++ Headers_2,
                       put, Value, [{response_format, binary}]) of
@@ -398,10 +416,12 @@ do_put(Url, Headers, Value) ->
     end.
 
 do_put_v4(Url, Headers, Value, ValSHA256) ->
-    {_, _, _, Auth} = gen_sig_v4("PUT", Url, ValSHA256),
+    TS = leo_date:now(),
+    {_, _, _, Auth} = gen_sig_v4("PUT", Url, ValSHA256, TS),
     Headers_2 = [
+                 {"Date", rfc1123_date_format(TS)},
                  {"x-amz-content-sha256", binary_to_list(ValSHA256)},
-                 {"x-amz-date", "20130524T000000Z"},
+                 {"x-amz-date", iso8601_date_format(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
                  {"authorization", Auth}
                 ],
@@ -418,15 +438,17 @@ do_put_v4(Url, Headers, Value, ValSHA256) ->
     end.
 
 do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash) ->
-    {Sign, _SignHead, SignKey, Auth} = gen_sig_v4("PUT", Url, <<"STREAMING-AWS4-HMAC-SHA256-PAYLOAD">>),
+    TS = leo_date:now(),
+    {Sign, _SignHead, SignKey, Auth} = gen_sig_v4("PUT", Url, <<"STREAMING-AWS4-HMAC-SHA256-PAYLOAD">>, TS),
     Headers_2 = [
+                 {"Date", rfc1123_date_format(TS)},
                  {"x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
-                 {"x-amz-date", "20130524T000000Z"},
+                 {"x-amz-date", iso8601_date_format(TS)},
                  {"x-amz-decoded-content-length", byte_size(Value)},
                  {"content-type", ?S3_CONTENT_TYPE},
                  {"authorization", Auth}
                 ],
-    Chunks = gen_chunks(Value, Sign, ChunkSize, SignKey, NoHash),
+    Chunks = gen_chunks(Value, Sign, ChunkSize, SignKey, NoHash, TS),
     case send_request(Url, Headers ++ Headers_2,
                       put, Chunks, [{response_format, binary}]) of
         {ok, "200", _Header, _Body} ->
@@ -441,23 +463,28 @@ do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash) ->
 
 %% @doc Generate aws-chunked Chunks
 %% @private
-gen_chunks(Bin, Signature, ChunkSize, SignKey, NoHash) ->
-    gen_chunks(Bin, Signature, <<>>, byte_size(Bin), ChunkSize, SignKey, NoHash).
+gen_chunks(Bin, Signature, ChunkSize, SignKey, NoHash, TS) ->
+    gen_chunks(Bin, Signature, <<>>, byte_size(Bin), ChunkSize, SignKey, NoHash, TS).
 
-gen_chunks(_Bin, PrevSign, Acc, 0, _ChunkSize, SignKey, NoHash) ->
-    {Chunk, _Sign} = compute_chunk(<<>>, PrevSign, SignKey, NoHash),
+gen_chunks(_Bin, PrevSign, Acc, 0, _ChunkSize, SignKey, NoHash, TS) ->
+    {Chunk, _Sign} = compute_chunk(<<>>, PrevSign, SignKey, NoHash, TS),
     <<Acc/binary, Chunk/binary>>;
-gen_chunks(Bin, PrevSign, Acc, Remain, ChunkSize, SignKey, NoHash) when Remain < ChunkSize ->
+gen_chunks(Bin, PrevSign, Acc, Remain, ChunkSize, SignKey, NoHash, TS) when Remain < ChunkSize ->
     <<ChunkPart:Remain/binary, _/binary>> = Bin,
-    {Chunk, Sign} = compute_chunk(ChunkPart, PrevSign, SignKey, NoHash),
-    gen_chunks(<<>>, Sign, <<Acc/binary, Chunk/binary>>, 0, ChunkSize, SignKey, NoHash);
-gen_chunks(Bin, PrevSign, Acc, Remain, ChunkSize, SignKey, NoHash) ->
+    {Chunk, Sign} = compute_chunk(ChunkPart, PrevSign, SignKey, NoHash, TS),
+    gen_chunks(<<>>, Sign, <<Acc/binary, Chunk/binary>>, 0, ChunkSize, SignKey, NoHash, TS);
+gen_chunks(Bin, PrevSign, Acc, Remain, ChunkSize, SignKey, NoHash, TS) ->
     <<ChunkPart:ChunkSize/binary, Rest/binary>> = Bin,
-    {Chunk, Sign} = compute_chunk(ChunkPart, PrevSign, SignKey, NoHash),
-    gen_chunks(Rest, Sign, <<Acc/binary, Chunk/binary>>, Remain - ChunkSize, ChunkSize, SignKey, NoHash).
+    {Chunk, Sign} = compute_chunk(ChunkPart, PrevSign, SignKey, NoHash, TS),
+    gen_chunks(Rest, Sign, <<Acc/binary, Chunk/binary>>, Remain - ChunkSize, ChunkSize, SignKey, NoHash, TS).
 
-compute_chunk(Bin, PrevSign, SignKey, NoHash) ->
-    SignHead = <<"20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n">>,
+compute_chunk(Bin, PrevSign, SignKey, NoHash, TS) ->
+    DateTimeBin = list_to_binary(iso8601_date_format(TS)),
+    {{Year, Month, Date},{_,_,_}} =
+        calendar:universal_time_to_local_time(
+          calendar:gregorian_seconds_to_datetime(TS)),
+    DateBin = list_to_binary(lists:flatten(io_lib:format("~4..0w~2..0w~2..0w", [Year, Month, Date]))),
+    SignHead = <<DateTimeBin/binary, "\n", DateBin/binary, "/us-east-1/s3/aws4_request\n">>,
     Size = byte_size(Bin),
     SizeHex = leo_hex:integer_to_hex(Size, 6),
     ChunkHashBin = case NoHash of
@@ -494,7 +521,8 @@ compute_chunk(Bin, PrevSign, SignKey, NoHash) ->
 %%     end.
 
 do_delete(Url) ->
-    case send_request(Url, [{'Authorization', gen_sig("DELETE", Url)}], delete, [], [{response_format, binary}]) of
+    TS = leo_date:now(),
+    case send_request(Url, [{"date", rfc1123_date_format(TS)}, {'Authorization', gen_sig("DELETE", Url, TS)}], delete, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
             {not_found, Url};
         {ok, "204", Headers, _Body} ->
