@@ -326,7 +326,7 @@ do_get_v4(Url) ->
     ValSHA256 = leo_hex:binary_to_hexbin(crypto:hash(sha256, <<>>)),
     {_, _, _, Auth} = gen_sig_v4("GET", Url, ValSHA256, TS),
     Headers_2 = [
-                 {"Date", rfc1123_date_format(TS)},
+                 {"Date", leo_http:rfc1123_date(TS)},
                  {"x-amz-content-sha256", ValSHA256},
                  {"x-amz-date", iso8601_date_format(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
@@ -362,17 +362,11 @@ iso8601_date_format(GregorianSeconds) ->
     lists:flatten(io_lib:format("~4..0w~2..0w~2..0wT~2..0w~2..0w~2..0wZ",
                   [Year, Month, Date, Hour, Min, Sec])).
 
-rfc1123_date_format(GregorianSeconds) ->
-    DateTime =
-        calendar:universal_time_to_local_time(
-          calendar:gregorian_seconds_to_datetime(GregorianSeconds)),
-    httpd_util:rfc1123_date(DateTime).
-
 gen_sig(HTTPMethod, Url, TS) ->
     [Bucket|_] = string:tokens(Url#url.path, "/"),
     SignParams = #sign_params{http_verb    = list_to_binary(HTTPMethod),
                               content_type = list_to_binary(?S3_CONTENT_TYPE),
-                              date         = list_to_binary(rfc1123_date_format(TS)),
+                              date         = list_to_binary(leo_http:rfc1123_date(TS)),
                               bucket       = list_to_binary(Bucket),
                               raw_uri      = list_to_binary(Url#url.path),
                               requested_uri = list_to_binary(Url#url.path),
@@ -399,7 +393,7 @@ gen_sig_v4(HTTPMethod, Url, ValSHA256, TS) ->
 do_put(Url, Headers, Value) ->
     TS = leo_date:now(),
     Headers_2 = [
-                 {"Date", rfc1123_date_format(TS)},
+                 {"Date", leo_http:rfc1123_date(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
                  {"authorization", gen_sig("PUT", Url, TS)}
                 ],
@@ -419,7 +413,7 @@ do_put_v4(Url, Headers, Value, ValSHA256) ->
     TS = leo_date:now(),
     {_, _, _, Auth} = gen_sig_v4("PUT", Url, ValSHA256, TS),
     Headers_2 = [
-                 {"Date", rfc1123_date_format(TS)},
+                 {"Date", leo_http:rfc1123_date(TS)},
                  {"x-amz-content-sha256", binary_to_list(ValSHA256)},
                  {"x-amz-date", iso8601_date_format(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
@@ -441,7 +435,7 @@ do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash) ->
     TS = leo_date:now(),
     {Sign, _SignHead, SignKey, Auth} = gen_sig_v4("PUT", Url, <<"STREAMING-AWS4-HMAC-SHA256-PAYLOAD">>, TS),
     Headers_2 = [
-                 {"Date", rfc1123_date_format(TS)},
+                 {"Date", leo_http:rfc1123_date(TS)},
                  {"x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
                  {"x-amz-date", iso8601_date_format(TS)},
                  {"x-amz-decoded-content-length", byte_size(Value)},
@@ -522,7 +516,7 @@ compute_chunk(Bin, PrevSign, SignKey, NoHash, TS) ->
 
 do_delete(Url) ->
     TS = leo_date:now(),
-    case send_request(Url, [{"date", rfc1123_date_format(TS)}, {'Authorization', gen_sig("DELETE", Url, TS)}], delete, [], [{response_format, binary}]) of
+    case send_request(Url, [{"date", leo_http:rfc1123_date(TS)}, {'Authorization', gen_sig("DELETE", Url, TS)}], delete, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
             {not_found, Url};
         {ok, "204", Headers, _Body} ->
