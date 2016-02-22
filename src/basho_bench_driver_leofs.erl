@@ -344,7 +344,13 @@ do_get_v4(Url) ->
     end.
 
 do_get(Url) ->
-    case send_request(Url, [], get, [], [{response_format, binary}]) of
+    TS = leo_date:now(),
+    Headers_2 = [
+                 {"Date", leo_http:rfc1123_date(TS)},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", gen_sig("GET", Url, TS)}
+                ],
+    case send_request(Url, Headers_2, get, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
             {not_found, Url};
         {ok, "200", Headers, Body} ->
