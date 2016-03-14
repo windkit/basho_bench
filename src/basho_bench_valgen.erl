@@ -59,6 +59,20 @@ new({function, Module, Function, Args}, Id)
         _Error ->
             ?FAIL_MSG("Could not find valgen function: ~p:~p\n", [Module, Function])
     end;
+new({size_groups_bin, List}, Id)
+  when is_list(List) ->
+    Source = init_source(Id),
+    SizeGroups = size_group_load_config(List, []),
+    Len = length(SizeGroups),
+    fun() ->
+        Nth = random:uniform(Len),
+        {Min, Max} = lists:nth(Nth, SizeGroups),
+        Size = case Max > Min of
+            true -> random:uniform(Max - Min) + Min - 1;
+            false -> Max
+        end,
+        data_block(Source, Size)
+    end;
 new({uniform_int, MaxVal}, _Id)
   when is_integer(MaxVal), MaxVal >= 1 ->
     fun() -> random:uniform(MaxVal) end;
@@ -116,4 +130,8 @@ data_block({SourceCfg, SourceSz}, BlockSize) ->
             Source
     end.
 
-
+size_group_load_config([], Acc) ->
+    lists:flatten(Acc);
+size_group_load_config([{Weight, Min, Max}|Rest], Acc) ->
+    List = lists:duplicate(Weight, {Min, Max}),
+    size_group_load_config(Rest, [List|Acc]).
