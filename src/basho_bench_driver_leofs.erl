@@ -38,12 +38,14 @@
                  value_size_groups,  % size groups for a value generator
                  aws_chunk_size,     % aws-chunked Chunk Size
                  aws_chunk_nohash,   % aws-chunked skip content SHA-256
+                 retry_on_overload,  % whether retry when LeoFS is overloaded (503)
                  check_integrity}).  % Params to test data integrity
 
 -define(S3_ACC_KEY,      "05236").
 -define(S3_SEC_KEY,      <<"802562235">>).
 -define(S3_CONTENT_TYPE, "application/octet-stream").
 -define(ETS_BODY_MD5, ets_body_md5).
+-define(OL_SLEEP_INTERNVAL, 500).
 
 %% ====================================================================
 %% API
@@ -100,6 +102,7 @@ new(Id) ->
     Concurrent = basho_bench_config:get(concurrent, 0),
     AWSChunkSize = basho_bench_config:get(aws_chunk_size, 131072),
     AWSChunkNoHash = basho_bench_config:get(aws_chunk_nohash, true),
+    RetryOnOL = basho_bench_config:get(retry_on_overload, false),
     {ok, #state { base_urls = BaseUrls,
                   base_urls_index = BaseUrlsIndex,
                   path_params = Params,
@@ -109,6 +112,7 @@ new(Id) ->
                   concurrent = Concurrent,
                   aws_chunk_size = AWSChunkSize,
                   aws_chunk_nohash = AWSChunkNoHash,
+                  retry_on_overload = RetryOnOL,
                   check_integrity = CI }}.
 
 keygen_global_uniq(false, _Id, _Concurrent, KeyGen) ->
@@ -119,10 +123,12 @@ keygen_global_uniq(true, Id, Concurrent, KeyGen) ->
     Diff = Rem - Id,
     Base - Diff.
 
-run(get, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+run(get, KeyGen, _ValueGen, #state{check_integrity = CI, 
+                                   retry_on_overload = RetryOnOL,
+                                   id = Id, concurrent = Concurrent} = State) ->
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
     {NextUrl, S2} = next_url(State),
-    case do_get(url(NextUrl, Key, State#state.path_params)) of
+    case do_get(url(NextUrl, Key, State#state.path_params), RetryOnOL) of
         {not_found, _Url} ->
             {ok, S2};
         {ok, _Url, _Headers, Body} ->
@@ -144,10 +150,12 @@ run(get, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = C
             {error, Reason, S2}
     end;
 
-run(getv4, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+run(getv4, KeyGen, _ValueGen, #state{check_integrity = CI, 
+                                     retry_on_overload = RetryOnOL,
+                                     id = Id, concurrent = Concurrent} = State) ->
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
     {NextUrl, S2} = next_url(State),
-    case do_get_v4(url(NextUrl, Key, State#state.path_params)) of
+    case do_get_v4(url(NextUrl, Key, State#state.path_params), RetryOnOL) of
         {not_found, _Url} ->
             {ok, S2};
         {ok, _Url, _Headers, Body} ->
@@ -184,6 +192,7 @@ run(test, _KeyGen, _ValueGen, #state{value_source = VS,
     {ok, State};
 
 run(put, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                   retry_on_overload = RetryOnOL,
                                    value_source = VS,
                                    value_size_groups = VSG, 
                                    id = Id,
@@ -192,7 +201,7 @@ run(put, KeyGen, _ValueGen, #state{check_integrity = CI,
     {_, Val} = value_gen_with_size_groups(VS, VSG),
     {NextUrl, S2} = next_url(State),
     Url = url(NextUrl, Key, State#state.path_params),
-    case do_put(Url, [], Val) of
+    case do_put(Url, [], Val, RetryOnOL) of
         ok ->
             case CI of
                 true ->
@@ -206,6 +215,7 @@ run(put, KeyGen, _ValueGen, #state{check_integrity = CI,
     end;
 
 run(putv4, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                     retry_on_overload = RetryOnOL,
                                      value_source = VS,
                                      value_size_groups = VSG,
                                      id = Id,
@@ -214,7 +224,7 @@ run(putv4, KeyGen, _ValueGen, #state{check_integrity = CI,
     {_, Val} = value_gen_with_size_groups(VS, VSG),
     {NextUrl, S2} = next_url(State),
     Url = url(NextUrl, Key, State#state.path_params),
-    case do_put_v4(Url, [], Val, <<"dummy">>) of
+    case do_put_v4(Url, [], Val, <<"dummy">>, RetryOnOL) of
         ok ->
             case CI of
                 true ->
@@ -228,6 +238,7 @@ run(putv4, KeyGen, _ValueGen, #state{check_integrity = CI,
     end;
 
 run(putv4chunk, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                          retry_on_overload = RetryOnOL,
                                           value_source = VS,
                                           value_size_groups = VSG,
                                           id = Id,
@@ -238,7 +249,7 @@ run(putv4chunk, KeyGen, _ValueGen, #state{check_integrity = CI,
     {_, Val} = value_gen_with_size_groups(VS, VSG),
     {NextUrl, S2} = next_url(State),
     Url = url(NextUrl, Key, State#state.path_params),
-    case do_put_v4_chunk(Url, [], Val, AWSChunkSize, AWSChunkNoHash) of
+    case do_put_v4_chunk(Url, [], Val, AWSChunkSize, AWSChunkNoHash, RetryOnOL) of
         ok ->
             case CI of
                 true ->
@@ -251,10 +262,12 @@ run(putv4chunk, KeyGen, _ValueGen, #state{check_integrity = CI,
             {error, Reason, S2}
     end;
 
-run(delete, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+run(delete, KeyGen, _ValueGen, #state{check_integrity = CI, 
+                                      retry_on_overload = RetryOnOL,
+                                      id = Id, concurrent = Concurrent} = State) ->
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
     {NextUrl, S2} = next_url(State),
-    case do_delete(url(NextUrl, Key, State#state.path_params)) of
+    case do_delete(url(NextUrl, Key, State#state.path_params), RetryOnOL) of
         {not_found, _Url} ->
             {ok, S2};
         {ok, _Url, _Headers} ->
@@ -321,7 +334,7 @@ next_url(State) ->
 url(BaseUrl, Key, Params) ->
     BaseUrl#url { path = lists:concat([BaseUrl#url.path, '/', Key, Params]) }.
 
-do_get_v4(Url) ->
+do_get_v4(Url, RetryOnOL) ->
     TS = leo_date:now(),
     ValSHA256 = leo_hex:binary_to_hexbin(crypto:hash(sha256, <<>>)),
     {_, _, _, Auth} = gen_sig_v4("GET", Url, ValSHA256, TS),
@@ -337,13 +350,15 @@ do_get_v4(Url) ->
             {not_found, Url};
         {ok, "200", Headers, Body} ->
             {ok, Url, Headers, Body};
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> do_get_v4(Url, RetryOnOL) end, RetryOnOL);
         {ok, Code, _Headers, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
             {error, Reason}
     end.
 
-do_get(Url) ->
+do_get(Url, RetryOnOL) ->
     TS = leo_date:now(),
     Headers_2 = [
                  {"Date", leo_http:rfc1123_date(TS)},
@@ -355,6 +370,8 @@ do_get(Url) ->
             {not_found, Url};
         {ok, "200", Headers, Body} ->
             {ok, Url, Headers, Body};
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> do_get(Url, RetryOnOL) end, RetryOnOL);
         {ok, Code, _Headers, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
@@ -396,7 +413,7 @@ gen_sig_v4(HTTPMethod, Url, ValSHA256, TS) ->
     Auth = io_lib:format("AWS4-HMAC-SHA256 Credential=~s, SignedHeaders=~s, Signature=~s", [Credential, SignedHeader, Sig]),
     {Sig, SignHead, SignKey, Auth}.
 
-do_put(Url, Headers, Value) ->
+do_put(Url, Headers, Value, RetryOnOL) ->
     TS = leo_date:now(),
     Headers_2 = [
                  {"Date", leo_http:rfc1123_date(TS)},
@@ -409,13 +426,15 @@ do_put(Url, Headers, Value) ->
             ok;
         {ok, "204", _Header, _Body} ->
             ok;
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> do_put(Url, Headers, Value, RetryOnOL) end, RetryOnOL);
         {ok, Code, _Header, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
             {error, Reason}
     end.
 
-do_put_v4(Url, Headers, Value, ValSHA256) ->
+do_put_v4(Url, Headers, Value, ValSHA256, RetryOnOL) ->
     TS = leo_date:now(),
     {_, _, _, Auth} = gen_sig_v4("PUT", Url, ValSHA256, TS),
     Headers_2 = [
@@ -431,13 +450,15 @@ do_put_v4(Url, Headers, Value, ValSHA256) ->
             ok;
         {ok, "204", _Header, _Body} ->
             ok;
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> do_put_v4(Url, Headers, Value, ValSHA256, RetryOnOL) end, RetryOnOL);
         {ok, Code, _Header, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
             {error, Reason}
     end.
 
-do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash) ->
+do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash, RetryOnOL) ->
     TS = leo_date:now(),
     {Sign, _SignHead, SignKey, Auth} = gen_sig_v4("PUT", Url, <<"STREAMING-AWS4-HMAC-SHA256-PAYLOAD">>, TS),
     Headers_2 = [
@@ -455,6 +476,8 @@ do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash) ->
             ok;
         {ok, "204", _Header, _Body} ->
             ok;
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> do_put_v4_chunk(Url, Headers, Value, ChunkSize, NoHash, RetryOnOL) end , RetryOnOL);
         {ok, Code, _Header, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
@@ -520,7 +543,7 @@ compute_chunk(Bin, PrevSign, SignKey, NoHash, TS) ->
 %%            {error, Reason}
 %%     end.
 
-do_delete(Url) ->
+do_delete(Url, RetryOnOL) ->
     TS = leo_date:now(),
     case send_request(Url, [{"date", leo_http:rfc1123_date(TS)}, {'Authorization', gen_sig("DELETE", Url, TS)}], delete, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
@@ -529,6 +552,8 @@ do_delete(Url) ->
             {ok, Url, Headers};
         {ok, "200", Headers, _Body} ->
             {ok, Url, Headers};
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> do_delete(Url, RetryOnOL) end, RetryOnOL);
         {ok, Code, _Headers, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
@@ -633,6 +658,15 @@ send_request(Url, Headers, Method, Body, Options, Count) ->
             end
     end.
 
+retry_handler(Handler, RetryOnOL) ->
+    case RetryOnOL of
+        true ->
+            io:format("Server Overloaded, Sleep ~p ms and Retry~n", [?OL_SLEEP_INTERNVAL]),
+            timer:sleep(?OL_SLEEP_INTERNVAL),
+            Handler();
+        _ ->
+            {error, {http_error, "503"}}
+    end.
 
 should_retry({error, send_failed})       -> true;
 should_retry({error, connection_closed}) -> true;
