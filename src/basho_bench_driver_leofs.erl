@@ -39,6 +39,8 @@
                  aws_chunk_size,     % aws-chunked Chunk Size
                  aws_chunk_nohash,   % aws-chunked skip content SHA-256
                  retry_on_overload,  % whether retry when LeoFS is overloaded (503)
+                 mp_part_size,       % Part Size for Multipart Upload
+                 mp_part_bin,        % Pre-gen Binary for Multipart Upload
                  check_integrity}).  % Params to test data integrity
 
 -define(S3_ACC_KEY,      "05236").
@@ -72,6 +74,9 @@ new(Id) ->
     Path = basho_bench_config:get(http_raw_path,     "/test_bucket/_test"),
     Params = basho_bench_config:get(http_raw_params, ""),
     Disconnect = basho_bench_config:get(http_raw_disconnect_frequency, infinity),
+    
+    PartSize = basho_bench_config:get(mp_part_size, 0),
+    PartBin = crypto:rand_bytes(PartSize),
 
     case Disconnect of
         infinity -> ok;
@@ -113,6 +118,8 @@ new(Id) ->
                   aws_chunk_size = AWSChunkSize,
                   aws_chunk_nohash = AWSChunkNoHash,
                   retry_on_overload = RetryOnOL,
+                  mp_part_size = PartSize,
+                  mp_part_bin = PartBin,
                   check_integrity = CI }}.
 
 keygen_global_uniq(false, _Id, _Concurrent, KeyGen) ->
@@ -257,6 +264,28 @@ run(putv4chunk, KeyGen, _ValueGen, #state{check_integrity = CI,
                     ets:insert(?ETS_BODY_MD5, {Key, LocalMD5});
                 false -> void
             end,
+            {ok, S2};
+        {error, Reason} ->
+            {error, Reason, S2}
+    end;
+
+run(mp_put, KeyGen, _ValueGen, #state{retry_on_overload = RetryOnOL,
+                                      mp_part_size = PartSize,
+                                      mp_part_bin = PartBin,
+                                      value_size_groups = VSG} = State) ->
+    Key = KeyGen(),
+    {NextUrl, S2} = next_url(State),
+    Url = url(NextUrl, Key, State#state.path_params),
+    
+    Len = length(VSG),
+    Nth = random:uniform(Len),
+    {Min, Max} = lists:nth(Nth, VSG),
+    Size = case Max > Min of
+        true -> random:uniform(Max - Min) + Min - 1;
+        false -> Max
+    end,
+    case do_mp(Url, [], Size, PartSize, PartBin, RetryOnOL) of
+        ok ->
             {ok, S2};
         {error, Reason} ->
             {error, Reason, S2}
@@ -678,3 +707,126 @@ normalize_error(Method, {'EXIT', {timeout, _}})  -> {error, {Method, timeout}};
 normalize_error(Method, {'EXIT', Reason})        -> {error, {Method, 'EXIT', Reason}};
 normalize_error(Method, {error, Reason})         -> {error, {Method, Reason}}.
 
+%% Init MP
+do_mp(Url, Headers, Size, PartSize, PartBin, RetryOnOL) ->
+    TS = leo_date:now(),
+    Url_2 = Url#url{ path = lists:concat([Url#url.path, "?uploads"])},
+    Headers_2 = [
+                 {"Date", leo_http:rfc1123_date(TS)},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", gen_sig("POST", Url_2, TS)}
+                ],
+    case send_request(Url_2, Headers ++ Headers_2,
+                      post, <<>>, [{response_format, binary}]) of
+        {ok, "200", _Header, Body} ->
+            {Start, _} = binary:match(Body, <<"<UploadId>">>),
+            {End, _} = binary:match(Body, <<"</UploadId>">>),
+            UploadId = binary:part(Body, Start + 10, End - Start - 10),
+            upload_parts(Url, Headers, binary_to_list(UploadId),
+                         Size, PartSize, PartBin, RetryOnOL);
+        {ok, Code, _Header, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+part_header(Url, UploadId, PartNum) ->
+    Url_2 = Url#url{ path = lists:concat([Url#url.path, "?partNumber=",
+                                          integer_to_list(PartNum),
+                                          "&uploadId=",
+                                          UploadId
+                                         ])},
+    TS = leo_date:now(),
+    Headers = [
+                 {"Date", leo_http:rfc1123_date(TS)},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", gen_sig("PUT", Url_2, TS)}
+                ],
+    {Url_2, Headers}.
+
+upload_parts(Url, Headers, UploadId, Size, PartSize, PartBin, RetryOnOL) ->
+    upload_parts(Url, Headers, UploadId, Size, PartSize, PartBin, RetryOnOL, 1).
+
+upload_parts(Url, Headers, UploadId, Size, PartSize, PartBin, RetryOnOL, Acc)
+  when Size > PartSize ->
+    {Url_2, Headers_2} = part_header(Url, UploadId, Acc),
+    case send_request(Url_2, Headers ++ Headers_2,
+                       put, PartBin, [{response_format, binary}]) of
+        {ok, "200", _Header, _Body} ->
+            upload_parts(Url, Headers, UploadId, Size - PartSize, PartSize, PartBin, RetryOnOL, Acc + 1);
+        {ok, "204", _Header, _Body} ->
+            upload_parts(Url, Headers, UploadId, Size - PartSize, PartSize, PartBin, RetryOnOL, Acc + 1);
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> upload_parts(Url, Headers, UploadId, Size, PartSize, PartBin, RetryOnOL, Acc) end, RetryOnOL);
+        {ok, Code, _Header, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+
+upload_parts(Url, Headers, UploadId, Size, PartSize, PartBin, RetryOnOL, Acc) ->
+    <<Bin:Size/binary, _/binary>> = PartBin,
+    PartBinETag = erlang:md5(PartBin),
+
+    {Url_2, Headers_2} = part_header(Url, UploadId, Acc),
+    case send_request(Url_2, Headers ++ Headers_2,
+                       put, Bin, [{response_format, binary}]) of
+        {ok, "200", _Header, _Body} ->
+            complete_mp(Url, Headers, UploadId, RetryOnOL, Acc, PartBinETag, erlang:md5(Bin));
+        {ok, "204", _Header, _Body} ->
+            complete_mp(Url, Headers, UploadId, RetryOnOL, Acc, PartBinETag, erlang:md5(Bin));
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() -> upload_parts(Url, Headers, UploadId, Size, PartSize, PartBin, RetryOnOL, Acc) end, RetryOnOL);
+        {ok, Code, _Header, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+complete_mp(Url, Headers, UploadId, RetryOnOL, Count, PartBinETag, LastETag) ->
+    EntriesBin = gen_mp_entries(1, Count, PartBinETag, LastETag, <<>>),
+    Bin = <<"<CompleteMultipartUpload>",
+            EntriesBin/binary,
+            "</CompleteMultipartUpload>">>,
+    
+    Url_2 = Url#url{ path = lists:concat([Url#url.path, 
+                                          "?uploadId=",
+                                          UploadId
+                                         ])},
+    TS = leo_date:now(),
+    Headers_2 = [
+                 {"Date", leo_http:rfc1123_date(TS)},
+                 {"content-type", ?S3_CONTENT_TYPE},
+                 {"authorization", gen_sig("POST", Url_2, TS)}
+                ],
+    case send_request(Url_2, Headers ++ Headers_2,
+                       post, Bin, [{response_format, binary}]) of
+        {ok, "200", _Header, _Body} ->
+            ok;
+        {ok, "204", _Header, _Body} ->
+            ok;
+        {ok, "503", _Header, _Body} ->
+            retry_handler(fun() ->  complete_mp(Url, Headers, UploadId, RetryOnOL, Count, PartBinETag, LastETag) end, RetryOnOL);
+        {ok, Code, _Header, _Body} ->
+            {error, {http_error, Code}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+gen_mp_entries(Count, Count, _PartBinETag, LastETag, Acc) ->
+    CountStr = integer_to_binary(Count),
+    ETagBin = leo_hex:binary_to_hexbin(LastETag),
+    Bin = <<"<Part>",
+            "<PartNumber>", CountStr/binary, "</PartNumber>",
+            "<ETag>", ETagBin/binary, "</ETag>",
+            "</Part>">>,
+    <<Acc/binary, Bin/binary>>;
+
+gen_mp_entries(Cur, Count, PartBinETag, LastETag, Acc) ->
+    CurStr = integer_to_binary(Cur),
+    ETagBin = leo_hex:binary_to_hexbin(PartBinETag),
+    Bin = <<"<Part>",
+            "<PartNumber>", CurStr/binary, "</PartNumber>",
+            "<ETag>", ETagBin/binary, "</ETag>",
+            "</Part>">>,
+    gen_mp_entries(Cur + 1, Count, PartBinETag, LastETag, <<Acc/binary, Bin/binary>>).
