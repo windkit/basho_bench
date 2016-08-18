@@ -36,5 +36,10 @@ run(write, KeyGen, ValueGen, State) ->
     end.
 
 next_file(KeyGen, #state{target_dir_path = TargetDir}) ->
-    filename:join(TargetDir, KeyGen()).
+    case KeyGen() of
+        Key when is_list(Key) ->
+            filename:join(TargetDir, Key);
+        Key ->
+            filename:join(TargetDir, integer_to_list(Key))
+    end.
 
