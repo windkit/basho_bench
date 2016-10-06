@@ -15,14 +15,15 @@
                  pick_groups }).
 
 new(Id) ->
-    Hosts = ["192.168.100.35:8080"],
-    Path = "/test",
-    S3Cmd = "~/s3cmd-1.6.1/s3cmd",
-    PartSizeMB = 5,
-    AccessKey = "05236",
-    SecretKey = "802562235",
-    TmpPath = "/dev/shm/",
-    SizeGroups = [{1, 1000000000}],
+    Hosts = basho_bench_config:get(hosts,   ["192.168.100.35:8080"]),
+    Path  = basho_bench_config:get(path,    "/test"),
+    S3Cmd = basho_bench_config:get(s3cmd,   "~/s3cmd-1.6.1/s3cmd"),
+    TmpPath    = basho_bench_config:get(tmp_path,       "/dev/shm"),
+    PartSizeMB = basho_bench_config:get(part_size_mb,   5),
+    AccessKey  = basho_bench_config:get(access_key,     "05236"),
+    SecretKey  = basho_bench_config:get(secret_key,     "802562235"),
+    SizeGroups = basho_bench_config:get(size_groups,    [{1, 1000000000}]),
+
     PickGroups = convert_size_groups_to_pick_groups(SizeGroups, 0, []),
     case Id of
         1 ->
