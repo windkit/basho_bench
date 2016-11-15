@@ -72,6 +72,10 @@ new({concat_binary, OneGen, TwoGen}, Id) ->
     fun() ->
             <<(Gen1())/binary, (Gen2())/binary>>
     end;
+new({reverse, InputGen, MaxKey}, Id)
+  when is_integer(MaxKey), MaxKey > 0 ->
+    Gen = new(InputGen, Id),
+    fun() -> MaxKey - Gen() + 1 end;
 new({sequential_int, MaxKey}, Id)
   when is_integer(MaxKey), MaxKey > 0 ->
     ?WARN("Are you sure that you want to use 'sequential_int'?\n"
@@ -136,6 +140,8 @@ dimension({base64, InputGen}) ->
     dimension(InputGen);
 dimension({concat_binary, OneGen, TwoGen}) ->
     erlang:min(dimension(OneGen), dimension(TwoGen));
+dimension({reverse, _, MaxKey}) ->
+    MaxKey;
 dimension({sequential_int, MaxKey}) ->
     MaxKey;
 dimension({partitioned_sequential_int, MaxKey}) ->
