@@ -41,6 +41,8 @@
                  retry_on_overload,  % whether retry when LeoFS is overloaded (503)
                  mp_part_size,       % Part Size for Multipart Upload
                  mp_part_bin,        % Pre-gen Binary for Multipart Upload
+                 get_range,          % Range Get Range
+                 get_size_groups,    % Range Get Size Groups
                  check_integrity}).  % Params to test data integrity
 
 -define(S3_ACC_KEY,      "05236").
@@ -77,6 +79,9 @@ new(Id) ->
     
     PartSize = basho_bench_config:get(mp_part_size, 0),
     PartBin = crypto:rand_bytes(PartSize),
+
+    GetRange = basho_bench_config:get(get_range, {0, 104857599}),
+    GetSizeGroups = basho_bench_config:get(get_size_groups, [{1, 102400, 102400}]),
 
     case Disconnect of
         infinity -> ok;
@@ -120,6 +125,8 @@ new(Id) ->
                   retry_on_overload = RetryOnOL,
                   mp_part_size = PartSize,
                   mp_part_bin = PartBin,
+                  get_range = GetRange,
+                  get_size_groups = size_group_load_config(GetSizeGroups, []),
                   check_integrity = CI }}.
 
 keygen_global_uniq(false, _Id, _Concurrent, KeyGen) ->
@@ -163,6 +170,45 @@ run(getv4, KeyGen, _ValueGen, #state{check_integrity = CI,
     Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
     {NextUrl, S2} = next_url(State),
     case do_get_v4(url(NextUrl, Key, State#state.path_params), RetryOnOL) of
+        {not_found, _Url} ->
+            {ok, S2};
+        {ok, _Url, _Headers, Body} ->
+            case CI of
+                true ->
+                    case ets:lookup(?ETS_BODY_MD5, Key) of
+                        [{_Key, LocalMD5}|_] ->
+                            RemoteMD5 = erlang:md5(Body),
+                            case RemoteMD5 =:= LocalMD5 of
+                                true -> {ok, S2};
+                                false -> {error, checksum_error, S2}
+                            end;
+                        _ -> {ok, S2}
+                    end;
+                false -> {ok, S2}
+            end;
+        {error, Reason} ->
+            io:format("~p~n",[Reason]),
+            {error, Reason, S2}
+    end;
+
+run(get_range, KeyGen, _ValueGen, #state{check_integrity = CI,
+                                         retry_on_overload = RetryOnOL,
+                                         id = Id, concurrent = Concurrent,
+                                         get_range = GetRange,
+                                         get_size_groups = GetSizeGroups} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
+    {NextUrl, S2} = next_url(State),
+    {Min, Max} = pick_random(GetSizeGroups),
+    Size = case Max > Min of
+               true -> random:uniform(Max - Min + 1) + Min - 1;
+               _ -> Max
+           end,
+    {Start, End} = GetRange,
+    Upper = End - Size,
+    Offset = random:uniform(Upper - Start + 1) + Start - 1,
+    Range = {Offset, Offset + Size - 1},
+
+    case do_get(url(NextUrl, Key, State#state.path_params), RetryOnOL, Range) of
         {not_found, _Url} ->
             {ok, S2};
         {ok, _Url, _Headers, Body} ->
@@ -388,17 +434,35 @@ do_get_v4(Url, RetryOnOL) ->
     end.
 
 do_get(Url, RetryOnOL) ->
+    do_get(Url, RetryOnOL, {}).
+
+do_get(Url, RetryOnOL, Range) ->
     TS = leo_date:now(),
     Headers_2 = [
                  {"Date", leo_http:rfc1123_date(TS)},
                  {"content-type", ?S3_CONTENT_TYPE},
                  {"authorization", gen_sig("GET", Url, TS)}
                 ],
-    case send_request(Url, Headers_2, get, [], [{response_format, binary}]) of
+    Headers_3 = case Range of
+                    {Start, End} ->
+                        Headers_2 ++
+                        [{"range", io_lib:format("bytes=~w-~w",[Start, End])}];
+                    _ ->
+                        Headers_2
+                end,
+
+    case send_request(Url, Headers_3, get, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
             {not_found, Url};
         {ok, "200", Headers, Body} ->
             {ok, Url, Headers, Body};
+        {ok, "206", Headers, Body} ->
+            case Range of
+                {_, _} ->
+                    {ok, Url, Headers, Body};
+                _ ->
+                    {error, {http_error, "206"}}
+            end;
         {ok, "503", _Header, _Body} ->
             retry_handler(fun() -> do_get(Url, RetryOnOL) end, RetryOnOL);
         {ok, Code, _Headers, _Body} ->
@@ -830,3 +894,8 @@ gen_mp_entries(Cur, Count, PartBinETag, LastETag, Acc) ->
             "<ETag>", ETagBin/binary, "</ETag>",
             "</Part>">>,
     gen_mp_entries(Cur + 1, Count, PartBinETag, LastETag, <<Acc/binary, Bin/binary>>).
+
+pick_random(List) ->
+    Len = length(List),
+    Pick = random:uniform(Len),
+    lists:nth(Pick, List).
